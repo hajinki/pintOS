@@ -18,7 +18,7 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
-#include "threads/malloc.h" //
+#include "threads/malloc.h" 
 
 struct start_process_args
   {
@@ -30,8 +30,6 @@ struct start_process_args
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 static void main_stack_setup (char *cmd, int argc, void **esp);
-static void deallocate_children (void);
-
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
@@ -44,7 +42,7 @@ process_execute (const char *file_name)
 
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
-  fn_copy = malloc (sizeof (char) * (strlen (file_name) + 1));
+  fn_copy = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
@@ -58,19 +56,10 @@ process_execute (const char *file_name)
   args.file_name_ = fn_copy;
   args.parent = thread_current ();
   args.loading_sema = &loading_sema;
-  printf("thread %d waiting for its child to load, sem %d\n", thread_current ()->tid, loading_sema.value);
   tid = thread_create (file_name, PRI_DEFAULT, start_process, &args);
-  printf(" %d child is %d\n", thread_current ()->tid, tid);
- /* Dont wait on loading_sema unless you are sure child was created
-     successfully (i.e. tid != -1), or else you will wait forever
-     because only the child can wake you up. */
-  if (tid == TID_ERROR){
+  sema_down (&loading_sema);
+  if (tid == TID_ERROR)
     palloc_free_page (fn_copy);
-    printf("FAILED TO LOAD:%d child is %d\n", thread_current ()->tid, tid);
-  }else{
-    sema_down (&loading_sema);
-    printf(" %d woke up\n", thread_current ()->tid);
-  }
   return tid;
 }
 
@@ -80,13 +69,12 @@ static void
 start_process (void *args_)
 { 
   struct start_process_args *args = args_;
-  printf("starting  %d's child %d\n", args->parent->tid, thread_current()->tid);
   char *file_name_ = args->file_name_;
   char *file_name, *token;
   struct intr_frame if_;
-  bool success = false;
+  bool success;
   int argc = 0;
-  printf("1\n");
+
   /* initialize child_elem */
   struct thread *cur = thread_current ();
   struct child_thread_elem *child_elem = malloc (sizeof(struct child_thread_elem));
@@ -96,19 +84,14 @@ start_process (void *args_)
   child_elem->t = cur;
   cur->child_elem = child_elem;
   list_push_back (&args->parent->children_list, &child_elem->elem);
-  printf("2\n");
 
   /* copy full file_name_ then tokenize it to get file_name and count argc */
   char *fn_copy = palloc_get_page (0);
-  printf("3\n");
   if (fn_copy == NULL)
-    goto failed;
+    thread_exit();
   strlcpy (fn_copy, (char*) file_name_, PGSIZE);
-  printf("4\n");
   char *save_ptr;
   file_name = strtok_r (fn_copy, " ", &save_ptr);
-  printf("5\n");
-  printf("starting  %d's child\n", args->parent->tid);
 
   /* count number of arguments */
   token = file_name;
@@ -117,7 +100,6 @@ start_process (void *args_)
      ++argc;
      token = strtok_r (NULL, " ", &save_ptr);
    }
-   printf("starting  %d's child\n", args->parent->tid);
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
@@ -126,37 +108,28 @@ start_process (void *args_)
   if_.eflags = FLAG_IF | FLAG_MBS;
   success = load (file_name, &if_.eip, &if_.esp);
 
-  failed:
   /* If load failed, quit. */
   palloc_free_page (fn_copy);
-
   if (!success)
     {
-      /* was allocated in process execute and passed to here in args. */
-      palloc_free_page (file_name_);
       child_elem->loading_status = -1;
       sema_up (args->loading_sema);
       thread_exit ();
     }
-    printf("starting  %d's child\n", args->parent->tid);
 
   /* push main function arguments to stack */
   main_stack_setup ((char*) file_name_, argc, &if_.esp);
-
-  /* was allocated in process execute and passed to here in args. */
-  palloc_free_page (file_name_);
-
-  child_elem->loading_status = 0;
-  sema_up (args->loading_sema);
-  printf("load successful, wake up parent %d, sema %d\n", args->parent->tid, args->loading_sema->value);
-
-
+  //test1 hex_dump((uintptr_t)if_.esp, if_.esp, (size_t)(PHYS_BASE - (uintptr_t)if_.esp), true);
+    
+    child_elem->loading_status = 0;
+    sema_up (args->loading_sema);
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
      threads/intr-stubs.S).  Because intr_exit takes all of its
      arguments on the stack in the form of a `struct intr_frame',
      we just point the stack pointer (%esp) to our stack frame
      and jump to it. */
+  
 
 
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
@@ -248,25 +221,25 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
-  close_all_files ();
-  deallocate_children ();
+  /* Close running file: for passing rox related tests */
+  if (cur->running_file != NULL)
+    {
+      file_allow_write(cur->running_file); // change with can do rewrite
+      file_close(cur->running_file);       // close file
+      cur->running_file = NULL;
+    }
+
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
   if (pd != NULL)
     {
-      /* Correct ordering here is crucial.  We must set
-         cur->pagedir to NULL before switching page directories,
-         so that a timer interrupt can't switch back to the
-         process page directory.  We must activate the base page
-         directory before destroying the process's page
-         directory, or our active page directory will be one
-         that's been freed (and cleared). */
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
 }
+
 
 /* Sets up the CPU for running user code in the current
    thread.
@@ -460,15 +433,15 @@ load (const char *file_name, void (**eip) (void), void **esp)
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
 
+  /* 실행 중인 파일에 대해 write 방지 설정 */
+  t->running_file = file;
+  file_deny_write(file);
+
   success = true;
 
-  done:
+ done:
   /* We arrive here whether the load is successful or not. */
-  if(success && file != NULL)
-    {
-      file_deny_write (file);
-      add_to_file_table (file);
-    }
+  //file_close (file); 실행중인 파일은 닫지 않음
   return success;
 }
 
@@ -580,44 +553,24 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
   return true;
 }
 
-#define STACK_SIZE 2
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
 static bool
 setup_stack (void **esp)
 {
-  uint8_t *kpage[STACK_SIZE];
-  bool install_success = false, allocate_success = true;
-  int i;
-  
-  for(i = 0; i < STACK_SIZE; i++) 
+  uint8_t *kpage;
+  bool success = false;
+
+  kpage = palloc_get_page (PAL_USER | PAL_ZERO);
+  if (kpage != NULL)
     {
-      kpage[i] = palloc_get_page (PAL_USER | PAL_ZERO);
-      if (kpage[i] == NULL) 
-        {
-          allocate_success = false;
-          while (i--)
-            palloc_free_page (kpage[i]);
-          break;
-        }
-    }
-  if (allocate_success)
-    {
-      for(i = 0; i < STACK_SIZE; i++) 
-        {
-          install_success = install_page (((uint8_t *) PHYS_BASE) - (i + 1) * PGSIZE, 
-                                      kpage[i], true);
-          if (!install_success)
-            {
-              while (i--)
-                palloc_free_page (kpage[i]);
-              break;
-            }
-        }
-      if (install_success)
+      success = install_page (((uint8_t *) PHYS_BASE) - PGSIZE, kpage, true);
+      if (success)
         *esp = PHYS_BASE;
+      else
+        palloc_free_page (kpage);
     }
-  return install_success && allocate_success;
+  return success;
 }
 
 /* Adds a mapping from user virtual address UPAGE to kernel
@@ -638,26 +591,4 @@ install_page (void *upage, void *kpage, bool writable)
      address, then map our page there. */
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
-
-}
-
-static void
-deallocate_children (void)
-{
-  printf("here: %d\n", thread_current ()->tid);
-  struct thread *t = thread_current ();
-  struct list *childern = &t->children_list;
-  struct list_elem *e = list_begin (childern);
-  struct child_thread_elem *entry;
-  int i = 0;
-  for(;e != list_end (childern); e = list_begin (childern))
-    {
-
-      printf("-------------------%d ", i);
-      printf("\n");
-      i++;
-      entry = list_entry (e, struct child_thread_elem, elem);
-      list_remove (&entry->elem);
-      free (entry);
-    }
 }
